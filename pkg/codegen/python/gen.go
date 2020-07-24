@@ -567,6 +567,7 @@ func (mod *modContext) genAwaitableType(w io.Writer, obj *schema.ObjectType) str
 	}
 	fmt.Fprintf(w, ") -> None:\n")
 	for _, prop := range obj.Properties {
+		// TODO: Need to properly check for input classes.
 		// Check that required arguments are present.  Also check that types are as expected.
 		pname := PyName(prop.Name)
 		ptype := pyType(prop.Type)
@@ -679,9 +680,9 @@ func (mod *modContext) genResource(res *schema.Resource) (string, error) {
 	fmt.Fprint(w, "\n")
 	fmt.Fprintf(w, "class %s(%s):\n", name, baseType)
 	for _, prop := range res.Properties {
-		name := PyName(prop.Name)
-		ty := mod.typeString(prop.Type, false, false, !prop.IsRequired)
-		fmt.Fprintf(w, "    %s: pulumi.Output[%s] = pulumi.output_property(\"%s\")\n", name, ty, prop.Name)
+		pname := PyName(prop.Name)
+		ty := mod.typeString(prop.Type, false, false, !prop.IsRequired, false)
+		fmt.Fprintf(w, "    %s: pulumi.Output[%s] = pulumi.output_property(\"%s\")\n", pname, ty, prop.Name)
 		if prop.Comment != "" {
 			printComment(w, prop.Comment, "    ")
 		}
@@ -697,7 +698,9 @@ func (mod *modContext) genResource(res *schema.Resource) (string, error) {
 
 	// If there's an argument type, emit it.
 	for _, prop := range res.InputProperties {
-		fmt.Fprintf(w, ", %s=None", PyName(prop.Name))
+		pname := PyName(prop.Name)
+		ty := mod.typeString(prop.Type, true, true, true /*optional*/, true /*orDict*/)
+		fmt.Fprintf(w, ", %s: %s = None", pname, ty)
 	}
 
 	// Old versions of TFGen emitted parameters named __name__ and __opts__. In order to preserve backwards
@@ -835,14 +838,16 @@ func (mod *modContext) genResource(res *schema.Resource) (string, error) {
 
 	if !res.IsProvider {
 		fmt.Fprintf(w, "    @staticmethod\n")
-		fmt.Fprintf(w, "    def get(resource_name, id, opts=None")
+		fmt.Fprintf(w, "    def get(resource_name: str, id: str, opts: Optional[pulumi.ResourceOptions] = None")
 
 		if res.StateInputs != nil {
 			for _, prop := range res.StateInputs.Properties {
-				fmt.Fprintf(w, ", %[1]s=None", PyName(prop.Name))
+				pname := PyName(prop.Name)
+				ty := mod.typeString(prop.Type, true, true, true /*optional*/, true /*orDict*/)
+				fmt.Fprintf(w, ", %s: %s = None", pname, ty)
 			}
 		}
-		fmt.Fprintf(w, "):\n")
+		fmt.Fprintf(w, ") -> '%s':\n", name)
 		mod.genGetDocstring(w, res)
 		fmt.Fprintf(w,
 			"        opts = pulumi.ResourceOptions.merge(opts, pulumi.ResourceOptions(id=id))\n")
@@ -946,10 +951,16 @@ func (mod *modContext) genFunction(fun *schema.Function) (string, error) {
 	fmt.Fprint(w, "\n")
 	fmt.Fprintf(w, "def %s(", name)
 	for _, arg := range args {
-		fmt.Fprintf(w, "%s=None, ", PyName(arg.Name))
+		pname := PyName(arg.Name)
+		ty := mod.typeString(arg.Type, true, false /*wrapInput*/, true /*optional*/, true /*orDict*/)
+		fmt.Fprintf(w, "%s: %s = None, ", pname, ty)
 	}
-	fmt.Fprintf(w, "opts=None")
-	fmt.Fprintf(w, "):\n")
+	fmt.Fprintf(w, "opts: Optional[pulumi.InvokeOptions] = None")
+	if retTypeName != "" {
+		fmt.Fprintf(w, ") -> %s:\n", retTypeName)
+	} else {
+		fmt.Fprintf(w, "):\n")
+	}
 
 	// If this func has documentation, write it at the top of the docstring, otherwise use a generic comment.
 	docs := &bytes.Buffer{}
@@ -961,7 +972,7 @@ func (mod *modContext) genFunction(fun *schema.Function) (string, error) {
 	if len(args) > 0 {
 		fmt.Fprintln(docs, "")
 		for _, arg := range args {
-			mod.genPropDocstring(docs, arg, false /*wrapInputs*/)
+			mod.genPropDocstring(docs, arg, false /*wrapInput*/, true /*orDict*/)
 		}
 	}
 	printComment(w, docs.String(), "    ")
@@ -1321,7 +1332,7 @@ func (mod *modContext) genInitDocstring(w io.Writer, res *schema.Resource) {
 	fmt.Fprintln(b, ":param str resource_name: The name of the resource.")
 	fmt.Fprintln(b, ":param pulumi.ResourceOptions opts: Options for the resource.")
 	for _, prop := range res.InputProperties {
-		mod.genPropDocstring(b, prop, true /*wrapInput*/)
+		mod.genPropDocstring(b, prop, true /*wrapInput*/, true /*orDict*/)
 	}
 
 	// printComment handles the prefix and triple quotes.
@@ -1341,7 +1352,7 @@ func (mod *modContext) genGetDocstring(w io.Writer, res *schema.Resource) {
 	fmt.Fprintln(b, ":param pulumi.ResourceOptions opts: Options for the resource.")
 	if res.StateInputs != nil {
 		for _, prop := range res.StateInputs.Properties {
-			mod.genPropDocstring(b, prop, true /*wrapInput*/)
+			mod.genPropDocstring(b, prop, true /*wrapInput*/, true /*orDict*/)
 		}
 	}
 
@@ -1359,20 +1370,20 @@ func (mod *modContext) genTypeDocstring(w io.Writer, comment string, properties 
 	}
 
 	for _, prop := range properties {
-		mod.genPropDocstring(b, prop, wrapInput)
+		mod.genPropDocstring(b, prop, wrapInput, false /*orDict*/)
 	}
 
 	// printComment handles the prefix and triple quotes.
 	printComment(w, b.String(), "        ")
 }
 
-func (mod *modContext) genPropDocstring(w io.Writer, prop *schema.Property, wrapInput bool) {
+func (mod *modContext) genPropDocstring(w io.Writer, prop *schema.Property, wrapInput, orDict bool) {
 	if prop.Comment == "" {
 		return
 	}
 
 	name := PyName(prop.Name)
-	ty := mod.typeString(prop.Type, true, wrapInput, false /*optional*/)
+	ty := mod.typeString(prop.Type, true, wrapInput, false /*optional*/, orDict)
 
 	// If this property has some documentation associated with it, we need to split it so that it is indented
 	// in a way that Sphinx can understand.
@@ -1391,32 +1402,35 @@ func (mod *modContext) genPropDocstring(w io.Writer, prop *schema.Property, wrap
 	}
 }
 
-func (mod *modContext) typeString(t schema.Type, input, wrapInput, optional bool) string {
+func (mod *modContext) typeString(t schema.Type, input, wrapInput, optional, orDict bool) string {
 	var typ string
 	switch t := t.(type) {
 	case *schema.ArrayType:
-		typ = fmt.Sprintf("List[%s]", mod.typeString(t.ElementType, input, wrapInput, false))
+		typ = fmt.Sprintf("List[%s]", mod.typeString(t.ElementType, input, wrapInput, false, orDict))
 	case *schema.MapType:
-		typ = fmt.Sprintf("Dict[str, %s]", mod.typeString(t.ElementType, input, wrapInput, false))
+		typ = fmt.Sprintf("Dict[str, %s]", mod.typeString(t.ElementType, input, wrapInput, false, orDict))
 	case *schema.ObjectType:
 		typ = mod.tokenToType(t.Token, input)
+		if orDict {
+			typ = fmt.Sprintf("pulumi.InputType[%s]", typ)
+		}
 	case *schema.TokenType:
 		// Use the underlying type for now.
 		if t.UnderlyingType != nil {
-			return mod.typeString(t.UnderlyingType, input, wrapInput, optional)
+			return mod.typeString(t.UnderlyingType, input, wrapInput, optional, orDict)
 		}
 		typ = "Any"
 	case *schema.UnionType:
 		if !input {
 			if t.DefaultType != nil {
-				return mod.typeString(t.DefaultType, input, wrapInput, optional)
+				return mod.typeString(t.DefaultType, input, wrapInput, optional, orDict)
 			}
 			typ = "Any"
 		} else {
 			elementTypeSet := stringSet{}
 			var elementTypes []schema.Type
 			for _, e := range t.ElementTypes {
-				et := mod.typeString(e, input, false, false)
+				et := mod.typeString(e, input, false, false, orDict)
 				if !elementTypeSet.has(et) {
 					elementTypeSet.add(et)
 					elementTypes = append(elementTypes, e)
@@ -1424,12 +1438,12 @@ func (mod *modContext) typeString(t schema.Type, input, wrapInput, optional bool
 			}
 
 			if len(elementTypes) == 1 {
-				return mod.typeString(elementTypes[0], input, wrapInput, optional)
+				return mod.typeString(elementTypes[0], input, wrapInput, optional, orDict)
 			}
 
 			var elements []string
 			for _, e := range elementTypes {
-				t := mod.typeString(e, input, wrapInput, false)
+				t := mod.typeString(e, input, wrapInput, false, orDict)
 				if wrapInput && strings.HasPrefix(t, "pulumi.Input[") {
 					contract.Assert(t[len(t)-1] == ']')
 					// Strip off the leading `pulumi.Input[` and the trailing `]`
@@ -1552,7 +1566,7 @@ func (mod *modContext) genType(
 	if input {
 		for _, prop := range props {
 			pname := PyName(prop.Name)
-			ty := mod.typeString(prop.Type, input, wrapInput, !prop.IsRequired)
+			ty := mod.typeString(prop.Type, input, wrapInput, !prop.IsRequired, false /*orDict*/)
 			fmt.Fprintf(w, "    %s: %s = pulumi.input_property(%q)\n", pname, ty, prop.Name)
 			if prop.Comment != "" {
 				printComment(w, prop.Comment, "    ")
@@ -1570,7 +1584,7 @@ func (mod *modContext) genType(
 		}
 		for _, prop := range props {
 			pname := PyName(prop.Name)
-			ty := mod.typeString(prop.Type, input, wrapInput, !prop.IsRequired)
+			ty := mod.typeString(prop.Type, input, wrapInput, !prop.IsRequired, false /*orDict*/)
 			var defaultValue string
 			if !prop.IsRequired {
 				defaultValue = " = None"
@@ -1625,7 +1639,7 @@ func (mod *modContext) genType(
 
 		for _, prop := range props {
 			pname := PyName(prop.Name)
-			ty := mod.typeString(prop.Type, input, wrapInput, !prop.IsRequired)
+			ty := mod.typeString(prop.Type, input, wrapInput, !prop.IsRequired, false /*orDict*/)
 			fmt.Fprintf(w, "    %s: %s = pulumi.output_property(%q)\n", pname, ty, prop.Name)
 			if prop.Comment != "" {
 				printComment(w, prop.Comment, "    ")

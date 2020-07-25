@@ -464,6 +464,15 @@ func (mod *modContext) genConfig(variables []*schema.Property) (string, error) {
 
 	mod.genHeader(w, true, false, imports)
 
+	// Export only the symbols we want exported.
+	if len(variables) > 0 {
+		fmt.Fprintf(w, "__all__ = [\n")
+		for _, p := range variables {
+			fmt.Fprintf(w, "    '%s',\n", PyName(p.Name))
+		}
+		fmt.Fprintf(w, "]\n\n")
+	}
+
 	// Create a config bag for the variables to pull from.
 	fmt.Fprintf(w, "__config__ = pulumi.Config('%s')\n", mod.pkg.Name)
 	fmt.Fprintf(w, "\n")
@@ -521,6 +530,19 @@ func (mod *modContext) genTypes(dir string, fs fs) error {
 
 		mod.genHeader(w, true, false, imports)
 
+		// Export only the symbols we want exported.
+		fmt.Fprintf(w, "__all__ = [\n")
+		for _, t := range mod.types {
+			if (input && mod.details(t).inputType) || (!input && mod.details(t).outputType) {
+				name := tokenToName(t.Token)
+				if input {
+					name += "Args"
+				}
+				fmt.Fprintf(w, "    '%s',\n", name)
+			}
+		}
+		fmt.Fprintf(w, "]\n\n")
+
 		var hasTypes bool
 		for _, t := range mod.types {
 			if input && mod.details(t).inputType {
@@ -551,8 +573,14 @@ func (mod *modContext) genTypes(dir string, fs fs) error {
 	return nil
 }
 
+func awaitableTypeNames(tok string) (baseName, awaitableName string) {
+	baseName = pyClassName(tokenToName(tok))
+	awaitableName = "Awaitable" + baseName
+	return
+}
+
 func (mod *modContext) genAwaitableType(w io.Writer, obj *schema.ObjectType) string {
-	baseName := pyClassName(tokenToName(obj.Token))
+	baseName, awaitableName := awaitableTypeNames(obj.Token)
 
 	// Produce a class definition with optional """ comment.
 	fmt.Fprint(w, "\n")
@@ -585,8 +613,6 @@ func (mod *modContext) genAwaitableType(w io.Writer, obj *schema.ObjectType) str
 		fmt.Fprintf(w, "        __self__.%[1]s = %[1]s\n", pname)
 		printComment(w, prop.Comment, "        ")
 	}
-
-	awaitableName := "Awaitable" + baseName
 
 	// Produce an awaitable subclass.
 	fmt.Fprint(w, "\n\n")
@@ -661,6 +687,14 @@ func (mod *modContext) genResource(res *schema.Resource) (string, error) {
 
 	mod.genHeader(w, true, jsonImportRequired(res), imports)
 
+	name := pyClassName(tokenToName(res.Token))
+	if res.IsProvider {
+		name = "Provider"
+	}
+
+	// Export only the symbols we want exported.
+	fmt.Fprintf(w, "__all__ = ['%s']\n\n", name)
+
 	baseType := "pulumi.CustomResource"
 	if res.IsProvider {
 		baseType = "pulumi.ProviderResource"
@@ -669,11 +703,6 @@ func (mod *modContext) genResource(res *schema.Resource) (string, error) {
 	if !res.IsProvider && res.DeprecationMessage != "" && mod.compatibility != kubernetes20 {
 		escaped := strings.ReplaceAll(res.DeprecationMessage, `"`, `\"`)
 		fmt.Fprintf(w, "warnings.warn(\"%s\", DeprecationWarning)\n\n", escaped)
-	}
-
-	name := pyClassName(tokenToName(res.Token))
-	if res.IsProvider {
-		name = "Provider"
 	}
 
 	// Produce a class definition with optional """ comment.
@@ -928,6 +957,16 @@ func (mod *modContext) genFunction(fun *schema.Function) (string, error) {
 	mod.genHeader(w, true, false, imports)
 
 	name := PyName(tokenToName(fun.Token))
+
+	// Export only the symbols we want exported.
+	fmt.Fprintf(w, "__all__ = [\n")
+	if fun.Outputs != nil {
+		baseName, awaitableName := awaitableTypeNames(fun.Outputs.Token)
+		fmt.Fprintf(w, "    '%s',\n", baseName)
+		fmt.Fprintf(w, "    '%s',\n", awaitableName)
+	}
+	fmt.Fprintf(w, "    '%s',\n", name)
+	fmt.Fprintf(w, "]\n\n")
 
 	if fun.DeprecationMessage != "" {
 		escaped := strings.ReplaceAll(fun.DeprecationMessage, `"`, `\"`)
